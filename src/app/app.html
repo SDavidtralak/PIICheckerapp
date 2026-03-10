@@ -1,0 +1,226 @@
+<div class="container">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">🛡</div>
+      <div class="logo-text">Check<span>PII</span></div>
+    </div>
+    <div class="header-meta">
+      <div><span class="status-dot"></span>DB Connected</div>
+      <div style="margin-top:3px">PII Monitoring — Report Engine</div>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <main>
+
+    <!-- LEFT: Query Builder -->
+    <aside>
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-header-icon">⚙</div>
+          <span class="panel-title">Query Builder</span>
+        </div>
+        <div class="panel-body">
+
+          <div class="field">
+            <label>Search Term</label>
+            <input type="text" [(ngModel)]="searchTerm" (input)="updatePreview()"
+              placeholder="Email, name, user ID, broker ID…" />
+          </div>
+
+          <div class="field">
+            <label>Table / View</label>
+            <select [(ngModel)]="dbTable" (change)="onTableChange()">
+              <option value="">— Select table or view —</option>
+              <optgroup label="Tables">
+                <option value="users">users</option>
+                <option value="user_pii_profiles">user_pii_profiles</option>
+                <option value="brokers">brokers</option>
+                <option value="scan_jobs">scan_jobs</option>
+                <option value="broker_findings">broker_findings</option>
+                <option value="finding_pii_categories">finding_pii_categories</option>
+              </optgroup>
+              <optgroup label="Views">
+                <option value="v_user_exposure_summary">v_user_exposure_summary</option>
+                <option value="v_user_broker_findings">v_user_broker_findings</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <!-- Dynamic status filter — only shown when table has statuses -->
+          <div class="field" *ngIf="statusOptions.length > 0">
+            <label>Filter by Status / Category</label>
+            <select [(ngModel)]="filterStatus" (change)="updatePreview()">
+              <option value="all">All</option>
+              <option *ngFor="let s of statusOptions" [value]="s">{{ s }}</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>Date Range</label>
+            <div class="date-row">
+              <input type="date" [(ngModel)]="dateFrom" (change)="updatePreview()" />
+              <input type="date" [(ngModel)]="dateTo" (change)="updatePreview()" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Include in Report</label>
+            <div class="check-group">
+              <label class="check-item">
+                <input type="checkbox" [(ngModel)]="incSummary" />
+                <span class="check-label">Summary statistics</span>
+              </label>
+              <label class="check-item">
+                <input type="checkbox" [(ngModel)]="incTable" />
+                <span class="check-label">Data table</span>
+              </label>
+              <label class="check-item">
+                <input type="checkbox" [(ngModel)]="incCharts" />
+                <span class="check-label">Charts &amp; graphs</span>
+              </label>
+              <label class="check-item">
+                <input type="checkbox" [(ngModel)]="incNotes" />
+                <span class="check-label">Analyst notes</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Additional Notes</label>
+            <textarea [(ngModel)]="notes" placeholder="Optional context or instructions…"></textarea>
+          </div>
+
+          <button class="btn btn-primary" [disabled]="isLoading" (click)="runSearch()">
+            <span *ngIf="!isLoading">⚡ Run Query &amp; Generate Report</span>
+            <div class="spinner" *ngIf="isLoading"></div>
+          </button>
+          <button class="btn btn-secondary" (click)="resetForm()">↺ Reset</button>
+
+        </div>
+      </div>
+    </aside>
+
+    <!-- RIGHT: Output -->
+    <section>
+
+      <!-- Query Preview -->
+      <div class="panel" style="margin-bottom:20px;">
+        <div class="panel-header">
+          <div class="panel-header-icon">&#123;&#125;</div>
+          <span class="panel-title">Live Query Preview</span>
+        </div>
+        <div class="panel-body" style="padding-bottom:16px;">
+          <div class="query-preview" [class.empty]="!queryPreview">
+            {{ queryPreview || 'Select a table and configure parameters to preview the query…' }}
+          </div>
+
+          <!-- Progress -->
+          <div class="progress-wrap" [class.active]="isLoading">
+            <div class="progress-label">
+              <span>{{ progressLabel }}</span>
+              <span>{{ progressPct }}%</span>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-fill" [style.width.%]="progressPct"></div>
+            </div>
+            <div class="progress-steps">
+              <div class="step" [class.active]="stepState[0]==='active'" [class.done]="stepState[0]==='done'">① Connect
+              </div>
+              <div class="step" [class.active]="stepState[1]==='active'" [class.done]="stepState[1]==='done'">② Query
+              </div>
+              <div class="step" [class.active]="stepState[2]==='active'" [class.done]="stepState[2]==='done'">③ Process
+              </div>
+              <div class="step" [class.active]="stepState[3]==='active'" [class.done]="stepState[3]==='done'">④ Render
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Report Panel -->
+      <div class="panel">
+
+        <!-- Placeholder -->
+        <div class="placeholder" *ngIf="!reportVisible">
+          <div class="placeholder-icon">🔍</div>
+          <div class="placeholder-text">Select a table and run a query to generate your PII exposure report.</div>
+        </div>
+
+        <!-- Report -->
+        <ng-container *ngIf="reportVisible">
+
+          <!-- Toolbar -->
+          <div class="report-toolbar">
+            <div class="report-meta">
+              Report generated: <strong>{{ reportTime }}</strong> &nbsp;·&nbsp;
+              Table: <strong>{{ dbTable }}</strong> &nbsp;·&nbsp;
+              <strong>{{ reportRows }}</strong> records
+            </div>
+            <div class="export-btns">
+              <button class="btn-sm" (click)="exportCSV()">⬇ CSV</button>
+              <button class="btn-sm" (click)="exportJSON()">⬇ JSON</button>
+              <button class="btn-sm" (click)="printReport()">⎙ Print</button>
+            </div>
+          </div>
+
+          <!-- Stats -->
+          <div class="stats-row" *ngIf="incSummary">
+            <div class="stat">
+              <span class="stat-val">{{ stats.total }}</span>
+              <span class="stat-lbl">Total Records</span>
+            </div>
+            <div class="stat">
+              <span class="stat-val">{{ stats.active }}</span>
+              <span class="stat-lbl">Active / Done</span>
+            </div>
+            <div class="stat">
+              <span class="stat-val">{{ stats.pending }}</span>
+              <span class="stat-lbl">{{ stats.label3 }}</span>
+            </div>
+            <div class="stat">
+              <span class="stat-val">{{ stats.flagged }}</span>
+              <span class="stat-lbl">{{ stats.label4 }}</span>
+            </div>
+          </div>
+
+          <!-- Table -->
+          <div class="table-wrap" *ngIf="incTable">
+            <table>
+              <thead>
+                <tr>
+                  <th *ngFor="let col of tableCols; let i = index" (click)="sortTable(i)"
+                    [class.sorted]="sortCol === i">
+                    {{ col }}
+                    <span class="sort-icon">{{ sortCol === i ? (sortAsc ? '↑' : '↓') : '⇅' }}</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr *ngFor="let row of reportData">
+                  <td *ngFor="let col of tableCols; let i = index">
+                    <ng-container *ngIf="isBadgeField(getFieldKey(i)); else plainCell">
+                      <span class="badge"
+                        [ngClass]="getBadgeClass(row[getFieldKey(i)]?.toString() || '', getFieldKey(i))">
+                        {{ row[getFieldKey(i)] }}
+                      </span>
+                    </ng-container>
+                    <ng-template #plainCell>
+                      <span [style.color]="i === 0 ? 'var(--accent)' : ''" [style.font-weight]="i === 0 ? '500' : ''">
+                        {{ row[getFieldKey(i)] }}
+                      </span>
+                    </ng-template>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+        </ng-container>
+      </div>
+
+    </section>
+  </main>
+</div>
