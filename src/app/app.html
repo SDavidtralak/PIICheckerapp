@@ -7,220 +7,280 @@
       <div class="logo-text">Check<span>PII</span></div>
     </div>
     <div class="header-meta">
-      <div><span class="status-dot"></span>DB Connected</div>
-      <div style="margin-top:3px">PII Monitoring — Report Engine</div>
+      <ng-container *ngIf="apiConnected">
+        <div><span class="status-dot"></span>Connected</div>
+        <div style="margin-top:3px" *ngIf="dbStats">
+          <strong style="color:var(--accent)">{{ dbStats.total_people | number }}</strong> records indexed
+        </div>
+        <div style="margin-top:3px;color:var(--text-dim);font-size:10px" *ngIf="dbStats?.last_updated">
+          Updated: <strong style="color:var(--text-dim)">{{ dbStats.last_updated }}</strong>
+        </div>
+      </ng-container>
+      <ng-container *ngIf="!apiConnected">
+        <div><span class="status-dot-red"></span>API Offline</div>
+        <div style="color:var(--danger);font-size:10px;margin-top:3px">Run: node server.js</div>
+      </ng-container>
     </div>
   </header>
 
-  <!-- Main -->
-  <main>
+  <!-- API offline banner -->
+  <div class="api-banner" *ngIf="!apiConnected">
+    ⚠ API not running. Open a terminal and run: <code>node server.js</code>
+  </div>
 
-    <!-- LEFT: Query Builder -->
-    <aside>
-      <div class="panel">
-        <div class="panel-header">
-          <div class="panel-header-icon">⚙</div>
-          <span class="panel-title">Query Builder</span>
+  <!-- ══ SCAN FORM (shown before scan or while scanning) ════════════ -->
+  <ng-container *ngIf="!scanResult && !notFound">
+    <div class="hero">
+      <div class="hero-badge">Free Personal Data Scan</div>
+      <h1 class="hero-title">Find out who has<br><span>your personal data</span></h1>
+      <p class="hero-sub">
+        We search {{ dbStats?.total_brokers || 15 }} data broker databases to find where your
+        personal information is listed — and help you remove it.
+      </p>
+    </div>
+
+    <div class="scan-card">
+      <div class="scan-card-header">
+        <span class="scan-card-icon">🔍</span>
+        <span class="scan-card-title">Enter Your Information</span>
+        <span class="scan-card-sub">Only used to search — never stored</span>
+      </div>
+
+      <div class="form-grid">
+        <div class="field required">
+          <label>First Name <span class="req">*</span></label>
+          <input type="text" [(ngModel)]="form.firstName" placeholder="e.g. David" />
         </div>
-        <div class="panel-body">
+        <div class="field required">
+          <label>Last Name <span class="req">*</span></label>
+          <input type="text" [(ngModel)]="form.lastName" placeholder="e.g. Smith" />
+        </div>
+        <div class="field">
+          <label>City</label>
+          <input type="text" [(ngModel)]="form.city" placeholder="e.g. Toronto" />
+        </div>
+        <div class="field">
+          <label>Province / State</label>
+          <select [(ngModel)]="form.province">
+            <option value="">— Optional —</option>
+            <optgroup label="🇨🇦 Canadian Provinces">
+              <option *ngFor="let p of canadianProvinces" [value]="p.code">{{ p.code }} — {{ p.name }}</option>
+            </optgroup>
+            <optgroup label="🇺🇸 US States">
+              <option *ngFor="let s of usStates" [value]="s">{{ s }}</option>
+            </optgroup>
+          </select>
+        </div>
+        <div class="field">
+          <label>Age <span class="hint">(helps narrow results)</span></label>
+          <input type="number" [(ngModel)]="form.age" placeholder="e.g. 34" min="1" max="120" />
+        </div>
+        <div class="field">
+          <label>Phone <span class="hint">(optional)</span></label>
+          <input type="text" [(ngModel)]="form.phone" placeholder="e.g. 416-555-1234" />
+        </div>
+      </div>
 
-          <div class="field">
-            <label>Search Term</label>
-            <input type="text" [(ngModel)]="searchTerm" (input)="updatePreview()"
-              placeholder="Email, name, user ID, broker ID…" />
+      <!-- Progress bar shown during scan -->
+      <div class="scan-progress" *ngIf="isScanning">
+        <div class="progress-label-row">
+          <span>{{ progressLabel }}</span>
+          <span>{{ progressPct }}%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" [style.width.%]="progressPct"></div>
+        </div>
+        <div class="progress-steps">
+          <div class="step" [class.active]="stepState[0]==='active'" [class.done]="stepState[0]==='done'">① Database
           </div>
-
-          <div class="field">
-            <label>Table / View</label>
-            <select [(ngModel)]="dbTable" (change)="onTableChange()">
-              <option value="">— Select table or view —</option>
-              <optgroup label="Tables">
-                <option value="users">users</option>
-                <option value="user_pii_profiles">user_pii_profiles</option>
-                <option value="brokers">brokers</option>
-                <option value="scan_jobs">scan_jobs</option>
-                <option value="broker_findings">broker_findings</option>
-                <option value="finding_pii_categories">finding_pii_categories</option>
-              </optgroup>
-              <optgroup label="Views">
-                <option value="v_user_exposure_summary">v_user_exposure_summary</option>
-                <option value="v_user_broker_findings">v_user_broker_findings</option>
-              </optgroup>
-            </select>
+          <div class="step" [class.active]="stepState[1]==='active'" [class.done]="stepState[1]==='done'">② US Brokers
           </div>
-
-          <!-- Dynamic status filter — only shown when table has statuses -->
-          <div class="field" *ngIf="statusOptions.length > 0">
-            <label>Filter by Status / Category</label>
-            <select [(ngModel)]="filterStatus" (change)="updatePreview()">
-              <option value="all">All</option>
-              <option *ngFor="let s of statusOptions" [value]="s">{{ s }}</option>
-            </select>
+          <div class="step" [class.active]="stepState[2]==='active'" [class.done]="stepState[2]==='done'">③ CA Brokers
           </div>
+          <div class="step" [class.active]="stepState[3]==='active'" [class.done]="stepState[3]==='done'">④ Report</div>
+        </div>
+      </div>
 
-          <div class="field">
-            <label>Date Range</label>
-            <div class="date-row">
-              <input type="date" [(ngModel)]="dateFrom" (change)="updatePreview()" />
-              <input type="date" [(ngModel)]="dateTo" (change)="updatePreview()" />
-            </div>
+      <button class="btn-scan" [disabled]="isScanning || !apiConnected" (click)="startScan()">
+        <span *ngIf="!isScanning">🔍 Scan Data Brokers Now</span>
+        <span *ngIf="isScanning">
+          <div class="spinner-inline"></div> Scanning...
+        </span>
+      </button>
+
+      <div class="scan-note">
+        🔒 Your search is private. We never store your personal information.
+      </div>
+    </div>
+
+    <!-- How it works -->
+    <div class="how-it-works">
+      <div class="hiw-item">
+        <div class="hiw-icon">🔍</div>
+        <div class="hiw-title">1. Search</div>
+        <div class="hiw-text">Enter your name and location to scan our database of {{ dbStats?.total_people | number }}
+          indexed records</div>
+      </div>
+      <div class="hiw-arrow">→</div>
+      <div class="hiw-item">
+        <div class="hiw-icon">📋</div>
+        <div class="hiw-title">2. See Your Exposure</div>
+        <div class="hiw-text">Get a full report showing exactly which brokers have your data and what's listed</div>
+      </div>
+      <div class="hiw-arrow">→</div>
+      <div class="hiw-item">
+        <div class="hiw-icon">🗑</div>
+        <div class="hiw-title">3. Remove It</div>
+        <div class="hiw-text">Use guided opt-out links or full automation to request removal from each broker</div>
+      </div>
+    </div>
+  </ng-container>
+
+  <!-- ══ NOT FOUND ══════════════════════════════════════════════════ -->
+  <ng-container *ngIf="notFound && !isScanning">
+    <div class="result-hero good">
+      <div class="result-icon">✅</div>
+      <div class="result-title">Good News!</div>
+      <div class="result-sub">No records found for <strong>{{ form.firstName }} {{ form.lastName }}</strong></div>
+      <p class="result-msg">{{ notFoundMsg }}</p>
+      <button class="btn-reset" (click)="resetScan()">← New Search</button>
+    </div>
+  </ng-container>
+
+  <!-- ══ RESULTS ════════════════════════════════════════════════════ -->
+  <ng-container *ngIf="scanResult && !isScanning">
+
+    <!-- Risk summary banner -->
+    <div class="risk-banner" [style.border-color]="riskColor">
+      <div class="risk-left">
+        <div class="risk-level" [style.color]="riskColor">{{ riskLabel }}</div>
+        <div class="risk-name">{{ form.firstName }} {{ form.lastName }}</div>
+        <div class="risk-detail">
+          Found on <strong>{{ scanResult.brokers_found }}</strong> broker {{ scanResult.brokers_found === 1 ? 'site' :
+          'sites' }}
+          &nbsp;·&nbsp;
+          <strong>{{ scanResult.total_found }}</strong> total {{ scanResult.total_found === 1 ? 'record' : 'records' }}
+        </div>
+      </div>
+      <div class="risk-right">
+        <div class="risk-gauge">
+          <div class="risk-gauge-fill" [style.width.%]="(scanResult.brokers_found / 15) * 100"
+            [style.background]="riskColor"></div>
+        </div>
+        <div class="risk-gauge-label">{{ scanResult.brokers_found }} / 15 brokers</div>
+      </div>
+    </div>
+
+    <!-- Progress tracker -->
+    <div class="opt-progress">
+      <div class="opt-progress-item">
+        <span class="opt-num" style="color:var(--danger)">{{ pendingCount }}</span>
+        <span class="opt-lbl">Pending Removal</span>
+      </div>
+      <div class="opt-progress-divider"></div>
+      <div class="opt-progress-item">
+        <span class="opt-num" style="color:var(--warning)">{{ scanResult.total_found - pendingCount - doneCount
+          }}</span>
+        <span class="opt-lbl">In Progress</span>
+      </div>
+      <div class="opt-progress-divider"></div>
+      <div class="opt-progress-item">
+        <span class="opt-num" style="color:var(--accent3)">{{ doneCount }}</span>
+        <span class="opt-lbl">Removed</span>
+      </div>
+      <button class="btn-optout-all" (click)="optOutAll()" *ngIf="pendingCount > 0">
+        🗑 Opt Out of All ({{ pendingCount }})
+      </button>
+    </div>
+
+    <!-- Records list -->
+    <div class="records-list">
+      <div class="record-card" *ngFor="let record of scanResult.records"
+        [class.done]="record.opt_out_status === 'done'">
+
+        <!-- Card header -->
+        <div class="record-header">
+          <div class="record-broker">
+            <span class="broker-flag">{{ getBrokerFlag(record.broker_country) }}</span>
+            <span class="broker-name">{{ record.broker_name }}</span>
           </div>
-
-          <div class="field">
-            <label>Include in Report</label>
-            <div class="check-group">
-              <label class="check-item">
-                <input type="checkbox" [(ngModel)]="incSummary" />
-                <span class="check-label">Summary statistics</span>
-              </label>
-              <label class="check-item">
-                <input type="checkbox" [(ngModel)]="incTable" />
-                <span class="check-label">Data table</span>
-              </label>
-              <label class="check-item">
-                <input type="checkbox" [(ngModel)]="incCharts" />
-                <span class="check-label">Charts &amp; graphs</span>
-              </label>
-              <label class="check-item">
-                <input type="checkbox" [(ngModel)]="incNotes" />
-                <span class="check-label">Analyst notes</span>
-              </label>
-            </div>
+          <div class="record-status" [class]="'status-' + record.opt_out_status">
+            {{ getStatusIcon(record.opt_out_status) }} {{ getStatusLabel(record.opt_out_status) }}
           </div>
+        </div>
 
-          <div class="field">
-            <label>Additional Notes</label>
-            <textarea [(ngModel)]="notes" placeholder="Optional context or instructions…"></textarea>
+        <!-- Exposed data -->
+        <div class="record-data">
+          <div class="data-item" *ngIf="record.full_name">
+            <span class="data-label">Name</span>
+            <span class="data-val">{{ record.full_name }}</span>
           </div>
+          <div class="data-item" *ngIf="record.age">
+            <span class="data-label">Age</span>
+            <span class="data-val">{{ record.age }}</span>
+          </div>
+          <div class="data-item" *ngIf="record.city || record.state">
+            <span class="data-label">Location</span>
+            <span class="data-val">{{ record.city }}{{ record.city && record.state ? ', ' : '' }}{{ record.state
+              }}</span>
+          </div>
+          <div class="data-item" *ngIf="record.phone">
+            <span class="data-label">Phone</span>
+            <span class="data-val sensitive">{{ record.phone }}</span>
+          </div>
+          <div class="data-item" *ngIf="record.email">
+            <span class="data-label">Email</span>
+            <span class="data-val sensitive">{{ record.email }}</span>
+          </div>
+          <div class="data-item" *ngIf="record.first_seen">
+            <span class="data-label">First seen</span>
+            <span class="data-val">{{ record.first_seen }}</span>
+          </div>
+        </div>
 
-          <button class="btn btn-primary" [disabled]="isLoading" (click)="runSearch()">
-            <span *ngIf="!isLoading">⚡ Run Query &amp; Generate Report</span>
-            <div class="spinner" *ngIf="isLoading"></div>
+        <!-- Opt-out actions -->
+        <div class="record-actions" *ngIf="record.opt_out_status !== 'done'">
+          <button class="btn-link" (click)="openOptOutLink(record)" title="Open your listing on this broker site">
+            🔗 View My Listing
           </button>
-          <button class="btn btn-secondary" (click)="resetForm()">↺ Reset</button>
+          <button class="btn-optout" (click)="openOptOutPage(record)" title="Go to this broker's opt-out page">
+            📋 Opt-Out Page
+          </button>
+          <button class="btn-auto" (click)="startAutomation(record)" title="Get step-by-step guided removal">
+            🤖 Auto Remove
+          </button>
+        </div>
 
+        <div class="record-done-msg" *ngIf="record.opt_out_status === 'done'">
+          ✅ Opt-out submitted — removal can take 24-72 hours to process.
         </div>
       </div>
-    </aside>
+    </div>
 
-    <!-- RIGHT: Output -->
-    <section>
+    <button class="btn-reset" style="margin:32px auto;display:block;" (click)="resetScan()">
+      ← New Search
+    </button>
 
-      <!-- Query Preview -->
-      <div class="panel" style="margin-bottom:20px;">
-        <div class="panel-header">
-          <div class="panel-header-icon">&#123;&#125;</div>
-          <span class="panel-title">Live Query Preview</span>
-        </div>
-        <div class="panel-body" style="padding-bottom:16px;">
-          <div class="query-preview" [class.empty]="!queryPreview">
-            {{ queryPreview || 'Select a table and configure parameters to preview the query…' }}
-          </div>
+  </ng-container>
 
-          <!-- Progress -->
-          <div class="progress-wrap" [class.active]="isLoading">
-            <div class="progress-label">
-              <span>{{ progressLabel }}</span>
-              <span>{{ progressPct }}%</span>
-            </div>
-            <div class="progress-bar">
-              <div class="progress-fill" [style.width.%]="progressPct"></div>
-            </div>
-            <div class="progress-steps">
-              <div class="step" [class.active]="stepState[0]==='active'" [class.done]="stepState[0]==='done'">① Connect
-              </div>
-              <div class="step" [class.active]="stepState[1]==='active'" [class.done]="stepState[1]==='done'">② Query
-              </div>
-              <div class="step" [class.active]="stepState[2]==='active'" [class.done]="stepState[2]==='done'">③ Process
-              </div>
-              <div class="step" [class.active]="stepState[3]==='active'" [class.done]="stepState[3]==='done'">④ Render
-              </div>
-            </div>
-          </div>
+  <!-- ══ AUTOMATION MODAL ═══════════════════════════════════════════ -->
+  <div class="modal-backdrop" *ngIf="automationRunning || (selectedRecord && automationLog.length > 0)"
+    (click)="closeAutomation()">
+    <div class="modal" (click)="$event.stopPropagation()">
+      <div class="modal-header">
+        <span>🤖 Auto Removal — {{ selectedRecord?.broker_name }}</span>
+        <button class="modal-close" (click)="closeAutomation()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="log-line" *ngFor="let line of automationLog">{{ line }}</div>
+        <div class="log-spinner" *ngIf="automationRunning">
+          <div class="spinner-inline"></div> Processing...
         </div>
       </div>
-
-      <!-- Report Panel -->
-      <div class="panel">
-
-        <!-- Placeholder -->
-        <div class="placeholder" *ngIf="!reportVisible">
-          <div class="placeholder-icon">🔍</div>
-          <div class="placeholder-text">Select a table and run a query to generate your PII exposure report.</div>
-        </div>
-
-        <!-- Report -->
-        <ng-container *ngIf="reportVisible">
-
-          <!-- Toolbar -->
-          <div class="report-toolbar">
-            <div class="report-meta">
-              Report generated: <strong>{{ reportTime }}</strong> &nbsp;·&nbsp;
-              Table: <strong>{{ dbTable }}</strong> &nbsp;·&nbsp;
-              <strong>{{ reportRows }}</strong> records
-            </div>
-            <div class="export-btns">
-              <button class="btn-sm" (click)="exportCSV()">⬇ CSV</button>
-              <button class="btn-sm" (click)="exportJSON()">⬇ JSON</button>
-              <button class="btn-sm" (click)="printReport()">⎙ Print</button>
-            </div>
-          </div>
-
-          <!-- Stats -->
-          <div class="stats-row" *ngIf="incSummary">
-            <div class="stat">
-              <span class="stat-val">{{ stats.total }}</span>
-              <span class="stat-lbl">Total Records</span>
-            </div>
-            <div class="stat">
-              <span class="stat-val">{{ stats.active }}</span>
-              <span class="stat-lbl">Active / Done</span>
-            </div>
-            <div class="stat">
-              <span class="stat-val">{{ stats.pending }}</span>
-              <span class="stat-lbl">{{ stats.label3 }}</span>
-            </div>
-            <div class="stat">
-              <span class="stat-val">{{ stats.flagged }}</span>
-              <span class="stat-lbl">{{ stats.label4 }}</span>
-            </div>
-          </div>
-
-          <!-- Table -->
-          <div class="table-wrap" *ngIf="incTable">
-            <table>
-              <thead>
-                <tr>
-                  <th *ngFor="let col of tableCols; let i = index" (click)="sortTable(i)"
-                    [class.sorted]="sortCol === i">
-                    {{ col }}
-                    <span class="sort-icon">{{ sortCol === i ? (sortAsc ? '↑' : '↓') : '⇅' }}</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr *ngFor="let row of reportData">
-                  <td *ngFor="let col of tableCols; let i = index">
-                    <ng-container *ngIf="isBadgeField(getFieldKey(i)); else plainCell">
-                      <span class="badge"
-                        [ngClass]="getBadgeClass(row[getFieldKey(i)]?.toString() || '', getFieldKey(i))">
-                        {{ row[getFieldKey(i)] }}
-                      </span>
-                    </ng-container>
-                    <ng-template #plainCell>
-                      <span [style.color]="i === 0 ? 'var(--accent)' : ''" [style.font-weight]="i === 0 ? '500' : ''">
-                        {{ row[getFieldKey(i)] }}
-                      </span>
-                    </ng-template>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-        </ng-container>
+      <div class="modal-footer" *ngIf="!automationRunning">
+        <button class="btn-optout" (click)="closeAutomation()">Close</button>
       </div>
+    </div>
+  </div>
 
-    </section>
-  </main>
 </div>
