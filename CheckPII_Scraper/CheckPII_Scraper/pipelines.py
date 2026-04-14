@@ -55,7 +55,9 @@ class MySQLPipeline:
             )
         return cls._pool
 
-    def open_spider(self, spider):
+    def open_spider(self, spider=None):
+        # spider arg kept for backward compat but we use self.crawler.spider
+        _spider = spider or (self.crawler.spider if hasattr(self, 'crawler') else None)
         self.pool              = self._get_pool()
         self.conn              = self.pool.get_connection()
         self.cursor            = self.conn.cursor()
@@ -64,7 +66,7 @@ class MySQLPipeline:
         self.batch_count       = 0
         self.scrape_start      = datetime.now()
         self.mark_done         = False   # PROTECTION 3 — tracks if mark phase ran
-        self.broker_id         = spider.broker_id
+        self.broker_id         = _spider.broker_id if _spider else 0
 
         # How many records exist for this broker before the run starts
         self.cursor.execute(
@@ -100,7 +102,7 @@ class MySQLPipeline:
         print(f"[Pipeline] Mark phase complete — {marked} records flagged for review.")
         self.mark_done = True
 
-    def process_item(self, item, spider):
+    def process_item(self, item, spider=None):
         try:
             broker_id = item.get('broker_id')
             full_name = (item.get('full_name') or '').strip()
@@ -219,7 +221,7 @@ class MySQLPipeline:
 
         return item
 
-    def close_spider(self, spider):
+    def close_spider(self, spider=None):
         # Final commit of any remaining batch
         self.conn.commit()
 

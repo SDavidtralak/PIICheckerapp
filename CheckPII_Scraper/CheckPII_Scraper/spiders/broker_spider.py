@@ -584,7 +584,12 @@ class BrokerSpider(scrapy.Spider):
         )
 
     # ── Entry point ────────────────────────────────────────────────────
-    async def start(self):
+    def start_requests(self):
+        """
+        Override start_requests instead of start() for Scrapy compatibility.
+        async def start() works in some versions but not all — start_requests()
+        is the stable API that works across all Scrapy versions.
+        """
         for url in self.start_urls:
             yield self._pw_request(url, callback=self.parse)
 
