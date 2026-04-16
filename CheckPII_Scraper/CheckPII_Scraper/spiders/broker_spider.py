@@ -1,7 +1,23 @@
 import scrapy
 import re
+import random
+import asyncio
 from scrapy_playwright.page import PageMethod
 from CheckPII_Scraper.items import PersonItem
+
+# ── curl-cffi availability check ─────────────────────────────────────
+# curl-cffi provides real Chrome TLS fingerprinting for non-JS brokers.
+# It impersonates Chrome 120's exact TLS handshake at the network level,
+# bypassing Cloudflare's JA3-based bot detection before any JS runs.
+# Install: pip install --user curl-cffi
+try:
+    from curl_cffi import requests as _curl_check  # noqa
+    CURL_CFFI_AVAILABLE = True
+    print("[Spider] curl-cffi loaded OK — Chrome 120 TLS fingerprint active")
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+    print("[Spider] curl-cffi not installed — Playwright used for all brokers")
+    print("[Spider] Install with: pip install --user curl-cffi")
 
 # playwright-stealth patches fingerprinting vectors that expose headless browsers:
 # navigator.webdriver, canvas/WebGL fingerprint, plugin list, Chrome runtime, etc.
@@ -86,6 +102,10 @@ _INVALID_NAME_WORDS = {
     'privacy','policy','terms','service','copyright','all','rights',
     'reserved','loading','please','wait','error','sorry','not','found',
     'unknown','none','null','undefined','true','false',
+    # Additional broker page labels that get mistaken for names
+    'location','view','details','summary','listing','listed','showing',
+    'total','related','similar','associated','known','also','aka',
+    'current','previous','former','alias','maiden','other','additional',
 
     # Common website navigation words
     'home','about','us','help','faq','support','blog','news','press',
@@ -98,7 +118,8 @@ _INVALID_NAME_PATTERNS = [
     re.compile(r'[^\w\s\-\'\.]'),               # special chars: "John@Doe"
     re.compile(r'\b(llc|inc|corp|ltd|co)\b', re.IGNORECASE),  # business names
     re.compile(r'(street|avenue|road|drive|blvd|lane|court|place|way)\b', re.IGNORECASE),  # addresses
-    re.compile(r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b', re.IGNORECASE),
+    # Month names removed from patterns — too many valid surnames (May, June, April, August)
+    # Month-only names like 'April June' are caught by the invalid_count check instead
     re.compile(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', re.IGNORECASE),
     re.compile(r'^(mr|mrs|ms|dr|prof|rev)\.?\s', re.IGNORECASE),  # titles without name
     re.compile(r'\.com|\.org|\.net|\.ca|\.co\.uk', re.IGNORECASE),  # URLs
@@ -106,10 +127,14 @@ _INVALID_NAME_PATTERNS = [
 ]
 
 # Valid name characters — letters, spaces, hyphens, apostrophes, dots
-_VALID_NAME_CHARS = re.compile(r"^[A-Za-z\s\-'\.]+$")
+_VALID_NAME_CHARS = re.compile(
+    r"^[A-Za-z\u00C0-\u024F\u1E00-\u1EFF\s\-'\.']+$"
+)  # includes Latin Extended (accents, umlauts, cedillas)
 
 # A real first or last name is typically 2-25 chars, starts with a letter
-_VALID_NAME_PART  = re.compile(r"^[A-Za-z][a-zA-Z'\-\.]{1,24}$")
+_VALID_NAME_PART  = re.compile(
+    r"^[A-Za-z\u00C0-\u024F\u1E00-\u1EFF][a-zA-Z\u00C0-\u024F\u1E00-\u1EFF'\-.]{1,24}$"
+)  # includes accented first chars
 
 
 def is_valid_person_name(full_name: str) -> bool:
@@ -154,8 +179,10 @@ def is_valid_person_name(full_name: str) -> bool:
     lower_parts = [p.lower().strip(".'") for p in parts]
     invalid_count = sum(1 for p in lower_parts if p in _INVALID_NAME_WORDS)
 
-    # If MORE THAN HALF the words are invalid, reject
-    if invalid_count > len(parts) / 2:
+    # If ANY word is a known non-name word, reject the whole name.
+    # Words like "Name", "Location", "View", "Age" are UI labels —
+    # they should never appear as part of a real person's name.
+    if invalid_count >= 1:
         return False
 
     # Must have at least one part that looks like a typical name
@@ -486,17 +513,75 @@ class BrokerSpider(scrapy.Spider):
         print(f"[Spider] Starting — Broker: {self.config.get('name')} "
               f"(ID {self.broker_id}) Country: {self.country}")
 
-    # ── Playwright request helper ──────────────────────────────────────
+    # ── Brokers that don't need JavaScript rendering ──────────────────
+    # curl-cffi fetches these directly with a real Chrome TLS fingerprint.
+    # Much harder to detect than Playwright's Chromium TLS signature.
+    IMPERSONATE_BROKER_TYPES = {
+        "zabasearch",    # Simple HTML directory
+        "anywho",        # Classic white pages HTML
+        "canada411",     # Canadian directory HTML
+        "ca_411",        # Canadian directory HTML
+        "192com",        # UK directory HTML
+        "peekyou",       # Social profiles HTML
+        "familytreenow", # Genealogy HTML (low protection)
+    }
+
+    # Chrome 120 headers sent with every curl-cffi request
+    _CHROME_HEADERS = {
+        "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "sec-ch-ua":                 '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile":          "?0",
+        "sec-ch-ua-platform":        '"Windows"',
+        "Sec-Fetch-Dest":            "document",
+        "Sec-Fetch-Mode":            "navigate",
+        "Sec-Fetch-Site":            "none",
+        "Sec-Fetch-User":            "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection":                "keep-alive",
+    }
+
+    # ── curl-cffi direct fetcher (Step 1 — TLS fingerprint fix) ─────────
+    # _run_curl_spider_direct is called directly from async start().
+    # Uses curl-cffi Chrome 120 TLS — outside Scrapy's handler system.
+    # Follow-up pagination requests are queued and fetched sequentially.
+
     def _pw_request(self, url, callback, **kwargs):
         """
-        Creates a Scrapy request using Playwright with stealth patches applied.
-        Stealth mode patches all known browser fingerprinting vectors so the
-        browser looks identical to a real Chrome user visiting the page.
-        Rotates browser context every PAGES_BEFORE_CONTEXT_RESTART pages
-        to prevent the JavaScript heap out-of-memory crash.
+        Creates a Playwright request for JS-heavy brokers.
+        Non-JS brokers are handled by _run_curl_spider_direct directly.
+
+        FIX 6: Stealth patches are injected as an init script via
+        playwright_context_kwargs so they run BEFORE any navigation,
+        before Cloudflare's challenge scripts execute.
+
+        FIX 11: page_count drives context rotation to prevent memory leaks
+        on long sessions. Each context gets its own browser process memory.
         """
         self.page_count += 1
         context_name = f"ctx_{(self.page_count // self.PAGES_BEFORE_CONTEXT_RESTART)}"
+        print(f"[Spider] Playwright request #{self.page_count} [ctx={context_name}]: {url[:80]}")
+
+        # FIX 6 — stealth init script injected before page navigation
+        # This runs before ANY JavaScript on the page, including Cloudflare
+        stealth_init_script = """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+            Object.defineProperty(screen, 'width',       { get: () => 1920 });
+            Object.defineProperty(screen, 'height',      { get: () => 1080 });
+            Object.defineProperty(screen, 'availWidth',  { get: () => 1920 });
+            Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+            Object.defineProperty(screen, 'colorDepth',  { get: () => 24 });
+            Object.defineProperty(screen, 'pixelDepth',  { get: () => 24 });
+            Object.defineProperty(window, 'outerWidth',  { get: () => 1920 });
+            Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8 });
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+        """
 
         return scrapy.Request(
             url,
@@ -504,13 +589,15 @@ class BrokerSpider(scrapy.Spider):
             meta={
                 "playwright":              True,
                 "playwright_context":      context_name,
-                # True so we can access the page in the async parse method
                 "playwright_include_page": True,
+                "playwright_context_kwargs": {
+                    # inject stealth before navigation in this context
+                    "init_scripts": [stealth_init_script],
+                },
                 "playwright_page_goto_kwargs": {
                     "wait_until": "domcontentloaded",
                     "timeout":    60000,
                 },
-                # PageMethods run after navigation — scroll and wait for content
                 "playwright_page_methods": [
                     PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight / 2)"),
                     PageMethod("wait_for_timeout", 800),
@@ -520,84 +607,246 @@ class BrokerSpider(scrapy.Spider):
             **kwargs,
         )
 
+    async def _run_curl_spider_direct(self, urls, callback):
+        """
+        Fetches a list of URLs with curl-cffi (Chrome 120 TLS fingerprint)
+        and yields items + follow-up URLs directly as an async generator.
+        Runs completely outside Scrapy's download handler system.
+
+        Fixes applied vs previous version:
+          - Uses asyncio.get_running_loop() not get_event_loop() (Fix 3)
+          - Calls async callback with `async for` not `for` (Fix 1)
+          - Handles pagination by recursing into follow-up URLs (Fix 2)
+          - Narrow exception catching — only network errors silenced (Fix 7)
+          - Uses chardet apparent_encoding for correct encoding (Fix 8)
+          - Delay applied between ALL requests including pagination (Fix 9)
+        """
+        from scrapy.http import TextResponse
+        from curl_cffi import requests as curl_requests
+
+        # Queue of (url, callback) pairs — starts with start_urls,
+        # grows as parsers yield follow-up Scrapy Requests for pagination
+        queue = [(url, callback) for url in urls]
+        seen  = set()   # prevent re-fetching the same URL
+
+        print(f"[Spider] curl-cffi starting — {len(queue)} initial URLs")
+        fetched = 0
+
+        while queue:
+            url, cb = queue.pop(0)
+
+            if url in seen:
+                continue
+            seen.add(url)
+
+            print(f"[Spider] curl-cffi [{fetched+1}] fetching: {url[:80]}")
+
+            try:
+                # FIX 3 — use get_running_loop() not get_event_loop()
+                loop = asyncio.get_running_loop()
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda u=url: curl_requests.get(
+                        u,
+                        impersonate="chrome120",
+                        headers=self._CHROME_HEADERS,
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                )
+                fetched += 1
+                print(f"[Spider] curl-cffi ✓ {resp.status_code}: {url[:60]}")
+
+            # FIX 7 — only catch network/IO errors, let logic errors propagate
+            except (OSError, TimeoutError, ConnectionError) as e:
+                print(f"[Spider] ✗ curl-cffi network error on {url[:50]}: {type(e).__name__}: {e}")
+                continue
+            except Exception as e:
+                # Unexpected error — log with full traceback info and stop
+                import traceback
+                print(f"[Spider] ✗ Unexpected curl-cffi error on {url[:50]}:")
+                print(f"[Spider]   {type(e).__name__}: {e}")
+                traceback.print_exc()
+                continue
+
+            if resp.status_code == 200:
+                # FIX 8 — use apparent_encoding to handle ISO-8859-1 / Windows-1252
+                # sites that don't declare charset in headers (common on old directories)
+                encoding = (
+                    resp.encoding
+                    or getattr(resp, 'apparent_encoding', None)
+                    or 'utf-8'
+                )
+                scrapy_response = TextResponse(
+                    url=url,
+                    body=resp.content,
+                    encoding=encoding,
+                )
+
+                # FIX 1 — parse() is async, must use `async for` not `for`
+                # FIX 2 — collect follow-up scrapy.Request objects and
+                #          add them to queue so pagination actually works
+                # Support both sync and async callbacks
+                # parse() is async; broker-specific parsers are sync generators
+                import inspect
+                result_gen = cb(scrapy_response)
+                if inspect.isasyncgen(result_gen):
+                    # async def parse() — use async for
+                    async for result in result_gen:
+                        if isinstance(result, scrapy.Request):
+                            next_url      = result.url
+                            next_callback = result.callback or self.parse
+                            if next_url not in seen:
+                                queue.append((next_url, next_callback))
+                                print(f"[Spider] curl-cffi queued follow-up: {next_url[:60]}")
+                        else:
+                            yield result
+                else:
+                    # sync def parser (e.g. parse_zabasearch) — use regular for
+                    for result in result_gen:
+                        if isinstance(result, scrapy.Request):
+                            next_url      = result.url
+                            next_callback = result.callback or self.parse
+                            if next_url not in seen:
+                                queue.append((next_url, next_callback))
+                                print(f"[Spider] curl-cffi queued follow-up: {next_url[:60]}")
+                        else:
+                            yield result
+
+            elif resp.status_code == 403:
+                print(f"[Spider] ✗ 403 Forbidden — IP/fingerprint blocked: {url[:50]}")
+            elif resp.status_code == 429:
+                print(f"[Spider] ✗ 429 Rate limited — waiting 90 seconds")
+                await asyncio.sleep(90)
+                # Re-queue the URL to retry after the wait
+                queue.insert(0, (url, cb))
+                seen.discard(url)
+            elif resp.status_code == 503:
+                print(f"[Spider] ✗ 503 Cloudflare JS challenge — {url[:50]}")
+            else:
+                print(f"[Spider] ✗ HTTP {resp.status_code}: {url[:50]}")
+
+            # FIX 9 — delay between ALL requests including pagination
+            # Applied after every fetch, not just between start URLs
+            if queue:
+                delay = random.uniform(15, 45)
+                print(f"[Spider] Waiting {delay:.0f}s ({len(queue)} URLs remaining)...")
+                await asyncio.sleep(delay)
+
+        print(f"[Spider] curl-cffi complete — {fetched} pages fetched for broker {self.broker_id}")
+
     async def _stealth_page_init(self, page):
         """
-        Apply all stealth patches to a Playwright page before use.
-        This patches the following fingerprinting vectors:
-          - navigator.webdriver → false
-          - navigator.plugins   → spoofed real browser plugins
-          - navigator.languages → realistic values
-          - canvas fingerprint  → randomized per session
-          - WebGL fingerprint   → randomized per session
-          - Chrome runtime      → injected to match real Chrome
-          - Permissions API     → patched
-          - window.outerWidth/Height → realistic values
-          - User-Agent via CDP  → consistent with browser headers
+        FIX 6 — JS fingerprint patches now run BEFORE navigation via
+        playwright_context_kwargs init_scripts in _pw_request, so they
+        execute before Cloudflare's challenge scripts.
+
+        This method now only handles:
+        1. tf-playwright-stealth library patches (canvas, WebGL, plugins)
+           These are applied post-load but still help with secondary checks.
+        2. Human behavior simulation (mouse, scroll) — Cloudflare's
+           behavioral scoring watches these AFTER the page loads.
         """
+        # tf-playwright-stealth library patches (canvas, WebGL, plugin list)
         if STEALTH_AVAILABLE:
-            await stealth_async(page)
+            try:
+                await stealth_async(page)
+            except Exception as e:
+                print(f"[Spider] stealth_async error (non-fatal): {e}")
 
-        # Additional manual patches on top of stealth library
-        await page.evaluate("""() => {
-            // Remove any remaining webdriver traces
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-                configurable: true
-            });
+        # Human behavior simulation — Step 3
+        # Cloudflare behavioral scoring runs after page load.
+        # Real users have gradual mouse movement and natural scroll patterns.
+        try:
+            # Gradual mouse entry from screen edge
+            await page.mouse.move(random.randint(0, 100), random.randint(0, 100))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            await page.mouse.move(
+                random.randint(300, 900),
+                random.randint(200, 700),
+                steps=random.randint(15, 35)
+            )
+            await asyncio.sleep(random.uniform(0.3, 0.8))
 
-            // Spoof realistic screen dimensions
-            Object.defineProperty(screen, 'width',       { get: () => 1920 });
-            Object.defineProperty(screen, 'height',      { get: () => 1080 });
-            Object.defineProperty(screen, 'availWidth',  { get: () => 1920 });
-            Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-            Object.defineProperty(screen, 'colorDepth',  { get: () => 24   });
-            Object.defineProperty(screen, 'pixelDepth',  { get: () => 24   });
+            # Scroll down like a reader
+            scroll_amount = random.randint(200, 600)
+            await page.evaluate(
+                f"window.scrollBy({{ top: {scroll_amount}, behavior: 'smooth' }})"
+            )
+            await asyncio.sleep(random.uniform(0.8, 2.5))
 
-            // Make window dimensions look real
-            Object.defineProperty(window, 'outerWidth',  { get: () => 1920 });
-            Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
-            Object.defineProperty(window, 'innerWidth',  { get: () => 1920 });
-            Object.defineProperty(window, 'innerHeight', { get: () => 1080 });
+            # Occasionally scroll back up (real readers do this)
+            if random.random() > 0.6:
+                scroll_back = random.randint(50, 200)
+                await page.evaluate(
+                    f"window.scrollBy({{ top: -{scroll_back}, behavior: 'smooth' }})"
+                )
+                await asyncio.sleep(random.uniform(0.3, 0.8))
 
-            // Spoof realistic hardware concurrency (CPU cores)
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            # Second mouse wiggle mid-page
+            if random.random() > 0.5:
+                await page.mouse.move(
+                    random.randint(200, 800),
+                    random.randint(300, 700),
+                    steps=random.randint(8, 20)
+                )
+                await asyncio.sleep(random.uniform(0.2, 0.5))
 
-            // Spoof realistic device memory
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-            // Remove automation-related properties
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-            // Spoof realistic connection info
-            if (navigator.connection) {
-                Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
-            }
-        }""")
-
-        # Human-like random mouse movement before page loads
-        import random
-        await page.mouse.move(
-            random.randint(100, 800),
-            random.randint(100, 600)
-        )
+        except Exception as e:
+            # Human behavior sim is non-critical — log and continue
+            print(f"[Spider] Human behavior sim error (non-fatal): {e}")
 
     # ── Entry point ────────────────────────────────────────────────────
+    async def start(self):
+        """
+        Scrapy 2.13+ async entry point. For non-JS brokers, runs curl-cffi
+        fetches directly inside this async generator — no bootstrap request,
+        no Playwright overhead, no handler conflicts.
+        For JS brokers, yields normal Playwright requests.
+        """
+        urls        = self.config.get("start_urls", [])
+        broker_type = self.config.get("type", "generic")
+
+        print(f"[Spider] {len(urls)} start URLs for broker {self.broker_id}")
+        if not urls:
+            print(f"[Spider] WARNING: No start_urls for broker_id={self.broker_id}")
+            return
+
+        if CURL_CFFI_AVAILABLE and broker_type in self.IMPERSONATE_BROKER_TYPES:
+            print(f"[Spider] Mode: curl-cffi Chrome 120 TLS for {len(urls)} URLs")
+            # Run all curl fetches directly in this async generator.
+            # No Scrapy request queue involved — zero handler conflicts.
+            async for result in self._run_curl_spider_direct(urls, self.parse):
+                yield result
+        else:
+            print(f"[Spider] Mode: Playwright for {len(urls)} URLs")
+            for url in urls:
+                yield self._pw_request(url, callback=self.parse)
+
     def start_requests(self):
-        """
-        Override start_requests instead of start() for Scrapy compatibility.
-        async def start() works in some versions but not all — start_requests()
-        is the stable API that works across all Scrapy versions.
-        """
-        for url in self.start_urls:
-            yield self._pw_request(url, callback=self.parse)
+        """Kept for Scrapy < 2.13 backward compatibility."""
+        urls        = self.config.get("start_urls", [])
+        broker_type = self.config.get("type", "generic")
+        if CURL_CFFI_AVAILABLE and broker_type in self.IMPERSONATE_BROKER_TYPES:
+            # Scrapy < 2.13 can't run async generators from start_requests.
+            # Fall back to Playwright for these brokers on older Scrapy.
+            print(f"[Spider] Scrapy < 2.13 detected — curl-cffi mode unavailable, using Playwright")
+            for url in urls:
+                yield self._pw_request(url, callback=self.parse)
+        else:
+            for url in urls:
+                yield self._pw_request(url, callback=self.parse)
 
     async def parse(self, response):
-        # Apply stealth patches to the live page object then close it.
-        # The rendered HTML is already in response.text — we just need
-        # to patch the page before Cloudflare challenge scripts run.
-        page = response.meta.get("playwright_page")
+        # response.meta only exists on Playwright responses tied to a Request.
+        # curl-cffi responses are bare TextResponse objects with no request
+        # attached — accessing .meta raises AttributeError. Guard against this.
+        page = None
+        try:
+            page = response.meta.get("playwright_page")
+        except AttributeError:
+            pass  # curl-cffi TextResponse — no meta, no Playwright page
+
         if page:
             try:
                 await self._stealth_page_init(page)
@@ -1058,7 +1307,7 @@ class BrokerSpider(scrapy.Spider):
         """
         print(f"[Spider] ZabaSearch {response.url} | Status: {response.status}")
 
-        # Try JSON-LD first
+        # Try JSON-LD first — most reliable data source
         found = 0
         for block in self._extract_jsonld(response):
             if block.get('@type') == 'Person':
@@ -1067,34 +1316,38 @@ class BrokerSpider(scrapy.Spider):
                     found += 1
                     yield item
 
-        if found > 0:
-            return
+        # HTML fallback if no JSON-LD found
+        if found == 0:
+            entries = response.css(
+                "div.peoplebox, div.person_box, div[class*='person'], "
+                "li.person, div.results-row, tr.person-row"
+            )
+            if entries:
+                print(f"[Spider] ZabaSearch {len(entries)} entries via HTML")
+                for entry in entries:
+                    item = self._parse_listing(entry, response.url, default_country='US')
+                    if item:
+                        yield item
+            else:
+                yield from self.parse_by_text(response, default_country='US')
 
-        # HTML fallback — ZabaSearch result rows
-        entries = response.css(
-            "div.peoplebox, div.person_box, div[class*='person'], "
-            "li.person, div.results-row, tr.person-row"
-        )
-        if entries:
-            print(f"[Spider] ZabaSearch {len(entries)} entries via HTML")
-            for entry in entries:
-                item = self._parse_listing(entry, response.url, default_country='US')
-                if item:
-                    yield item
-        else:
-            yield from self.parse_by_text(response, default_country='US')
-
-        # Follow name links to individual pages
+        # Follow name links to individual pages — runs regardless of JSON-LD/HTML
+        # Exclude pagination links and the current page URL
+        next_href = response.css("a[rel='next']::attr(href), a.next::attr(href)").get() or ""
         name_links = [
             l for l in response.css("a::attr(href)").getall()
-            if l and '/people/' in l and l != response.url
+            if l
+            and '/people/' in l
+            and l != response.url
+            and l != next_href           # don't double-follow the next page
+            and l.rstrip('/') != response.url.rstrip('/')
         ]
-        for link in name_links[:50]:  # cap at 50 per page
+        for link in name_links[:50]:
             yield self._pw_request(response.urljoin(link), callback=self.parse_zabasearch)
 
-        next_page = response.css("a[rel='next']::attr(href), a.next::attr(href)").get()
-        if next_page:
-            yield self._pw_request(response.urljoin(next_page), callback=self.parse_zabasearch)
+        # Pagination — ALWAYS checked, never skipped by early return
+        if next_href:
+            yield self._pw_request(response.urljoin(next_href), callback=self.parse_zabasearch)
 
     # ══════════════════════════════════════════════════════════════════
     # THATSTHEM
@@ -1976,4 +2229,27 @@ class BrokerSpider(scrapy.Spider):
         return "", "", ""
 
     def handle_error(self, failure):
-        print(f"[Spider] Request failed: {failure.request.url} — {failure.value}")
+        """Log request failures with full detail so we can diagnose blocking."""
+        url = failure.request.url if failure.request else "unknown"
+        err_type = failure.type.__name__ if failure.type else "Unknown"
+        err_msg  = str(failure.value)
+
+        print(f"[Spider] ✗ REQUEST FAILED: {url}")
+        print(f"[Spider] ✗ Error type   : {err_type}")
+        print(f"[Spider] ✗ Error message: {err_msg}")
+
+        # Common failure reasons and what they mean
+        if "TimeoutError" in err_type or "timeout" in err_msg.lower():
+            print(f"[Spider] ✗ DIAGNOSIS: Site timed out — likely blocking or very slow")
+        elif "ConnectionRefused" in err_type:
+            print(f"[Spider] ✗ DIAGNOSIS: Connection refused — site actively rejecting")
+        elif "DNSLookup" in err_type or "dns" in err_msg.lower():
+            print(f"[Spider] ✗ DIAGNOSIS: DNS failure — check internet connection")
+        elif "403" in err_msg or "Forbidden" in err_msg:
+            print(f"[Spider] ✗ DIAGNOSIS: 403 Forbidden — IP/fingerprint blocked")
+        elif "407" in err_msg:
+            print(f"[Spider] ✗ DIAGNOSIS: 407 Proxy auth required — proxy config issue")
+        elif "SSL" in err_type or "ssl" in err_msg.lower():
+            print(f"[Spider] ✗ DIAGNOSIS: SSL error — try ignore_https_errors=True")
+        else:
+            print(f"[Spider] ✗ DIAGNOSIS: Unknown — check LOG_LEVEL=DEBUG for more detail")

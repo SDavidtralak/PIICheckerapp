@@ -169,7 +169,7 @@ class ProxyRotatorMiddleware:
         return (f"https://api.scraperapi.com/?api_key={self.scraperapi_key}"
                 f"&url={encoded}&render=true&country_code=us")
 
-    def process_request(self, request, spider):
+    def process_request(self, request, spider=None):
         if self.mode == 'off':
             return
 
@@ -191,7 +191,7 @@ class ProxyRotatorMiddleware:
                 request.meta['_proxy_used'] = proxy
                 logger.debug(f"[ProxyRotator] Using proxy: {proxy}")
 
-    def process_response(self, request, response, spider):
+    def process_response(self, request, response, spider=None):
         # Mark proxy as failed if we got a block response
         proxy = request.meta.get('_proxy_used')
         if proxy and response.status in (403, 407, 429, 503):
@@ -199,7 +199,7 @@ class ProxyRotatorMiddleware:
             self._mark_failure(proxy)
         return response
 
-    def process_exception(self, request, exception, spider):
+    def process_exception(self, request, exception, spider=None):
         # Mark proxy as failed on connection errors
         proxy = request.meta.get('_proxy_used')
         if proxy:
